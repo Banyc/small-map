@@ -65,27 +65,27 @@ pub(crate) trait SizedTypeProperties: Sized {
 impl<T> SizedTypeProperties for T {}
 
 /// A reference to an empty bucket into which an can be inserted.
-pub(crate) struct InsertSlot {
+pub(crate) struct VacantEntry {
     pub(crate) index: usize,
 }
 
 /// A reference to a hash table bucket containing a `T`.
-pub(crate) struct Bucket<T> {
+pub(crate) struct EntryRef<T> {
     ptr: NonNull<T>,
 }
 
 // This Send impl is needed for rayon support. This is safe since Bucket is
 // never exposed in a public API.
-unsafe impl<T> Send for Bucket<T> {}
+unsafe impl<T> Send for EntryRef<T> {}
 
-impl<T> Clone for Bucket<T> {
+impl<T> Clone for EntryRef<T> {
     #[inline]
     fn clone(&self) -> Self {
         Self { ptr: self.ptr }
     }
 }
 
-impl<T> Bucket<T> {
+impl<T> EntryRef<T> {
     /// Creates a [`Bucket`] that contain pointer to the data.
     /// The pointer calculation is performed by calculating the
     /// offset from given `base` pointer (convenience for

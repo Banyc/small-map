@@ -1,11 +1,11 @@
 use core::{iter::FusedIterator, mem::MaybeUninit, ptr::NonNull};
 
 use super::RawIterInner;
-use crate::{inline::AlignedGroups, raw::util::Bucket};
+use crate::{inline::AlignedTags, raw::util::EntryRef};
 
 pub(crate) struct RawIter<'a, const N: usize, T> {
     pub(crate) inner: RawIterInner<T>,
-    pub(crate) aligned_groups: &'a AlignedGroups<N>,
+    pub(crate) aligned_groups: &'a AlignedTags<N>,
     pub(crate) data: &'a [MaybeUninit<T>; N],
 }
 
@@ -15,7 +15,7 @@ impl<'a, const N: usize, T> Iterator for RawIter<'a, N, T> {
     #[inline]
     fn next(&mut self) -> Option<&'a T> {
         match self.inner.next(self.aligned_groups.as_ptr(), unsafe {
-            Bucket::from_base_index(NonNull::new_unchecked(self.data.as_ptr() as _), 0)
+            EntryRef::from_base_index(NonNull::new_unchecked(self.data.as_ptr() as _), 0)
         }) {
             Some(x) => unsafe {
                 let r = x.as_ref();
@@ -41,8 +41,8 @@ impl<const N: usize, T> FusedIterator for RawIter<'_, N, T> {}
 
 pub(crate) struct RawIntoIter<const N: usize, T> {
     pub(crate) inner: RawIterInner<T>,
-    pub(crate) aligned_groups: AlignedGroups<N>,
-    pub(crate) data: [MaybeUninit<T>; N],
+    pub(crate) aligned_tags: AlignedTags<N>,
+    pub(crate) entries: [MaybeUninit<T>; N],
 }
 
 impl<const N: usize, T> Iterator for RawIntoIter<N, T> {
@@ -54,8 +54,11 @@ impl<const N: usize, T> Iterator for RawIntoIter<N, T> {
             Some(
                 self.inner
                     .next(
-                        self.aligned_groups.as_ptr(),
-                        Bucket::from_base_index(NonNull::new_unchecked(self.data.as_ptr() as _), 0),
+                        self.aligned_tags.as_ptr(),
+                        EntryRef::from_base_index(
+                            NonNull::new_unchecked(self.entries.as_ptr() as _),
+                            0,
+                        ),
                     )?
                     .read(),
             )
@@ -77,8 +80,8 @@ impl<const N: usize, T> Drop for RawIntoIter<N, T> {
         unsafe {
             // Drop all remaining elements
             self.inner.drop_elements(
-                self.aligned_groups.as_ptr(),
-                Bucket::from_base_index(NonNull::new_unchecked(self.data.as_ptr() as _), 0),
+                self.aligned_tags.as_ptr(),
+                EntryRef::from_base_index(NonNull::new_unchecked(self.entries.as_ptr() as _), 0),
             );
         }
     }

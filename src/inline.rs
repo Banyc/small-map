@@ -9,7 +9,7 @@ use crate::{
     raw::{
         h2,
         iter::{RawIntoIter, RawIter},
-        util::{equivalent_key, likely, make_hash, Bucket, InsertSlot, SizedTypeProperties},
+        util::{equivalent_key, likely, make_hash, EntryRef, SizedTypeProperties, VacantEntry},
         BitMaskWord, Group, RawIterInner, DELETED, EMPTY,
     },
     Equivalent,
@@ -23,44 +23,70 @@ pub struct Inline<const N: usize, K, V, S> {
 }
 
 struct RawInline<const N: usize, T> {
-    aligned_groups: AlignedGroups<N>,
+    aligned_tags: AlignedTags<N>,
     len: usize,
-    data: [MaybeUninit<T>; N],
+    entries: [MaybeUninit<T>; N],
 }
 
 impl<const N: usize, T: Clone> Clone for RawInline<N, T> {
     #[inline]
     fn clone(&self) -> Self {
         let mut data = unsafe { MaybeUninit::<[MaybeUninit<T>; N]>::uninit().assume_init() };
-        for (idx, d) in self.data.iter().take(self.len).enumerate() {
+        for (idx, d) in self.entries.iter().take(self.len).enumerate() {
             unsafe {
                 data[idx] = MaybeUninit::new(d.assume_init_ref().clone());
             }
         }
         Self {
-            aligned_groups: self.aligned_groups,
+            aligned_tags: self.aligned_tags,
             len: self.len,
-            data,
+            entries: data,
         }
     }
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub(crate) struct AlignedGroups<const N: usize> {
-    groups: [u8; N],
+pub(crate) struct AlignedTags<const N: usize> {
+    tags: [u8; N],
     _align: [Group; 0],
 }
 
-impl<const N: usize> AlignedGroups<N> {
+impl<const N: usize> AlignedTags<N> {
     #[inline]
-    unsafe fn ctrl(&self, index: usize) -> *mut u8 {
-        self.groups.as_ptr().add(index).cast_mut()
+    unsafe fn tag(&self, index: usize) -> *mut u8 {
+        self.tags.as_ptr().add(index).cast_mut()
     }
 
     #[inline]
     pub(crate) fn as_ptr(&self) -> NonNull<u8> {
-        unsafe { NonNull::new_unchecked(self.groups.as_ptr() as _) }
+        unsafe { NonNull::new_unchecked(self.tags.as_ptr() as _) }
+    }
+
+    #[inline]
+    pub(crate) unsafe fn group_unchecked(&self, index: usize) -> Group {
+        let tag_index = index * Group::SIZE;
+        Group::load(self.tag(tag_index))
+    }
+
+    #[inline]
+    pub(crate) fn num_complete_groups(&self) -> usize {
+        Self::NUM_GROUPS
+    }
+    const NUM_GROUPS: usize = N / Group::SIZE;
+
+    #[inline]
+    pub(crate) fn tail_mask(&self) -> Option<BitMaskWord> {
+        if N % Group::SIZE == 0 {
+            return None;
+        }
+        Some(Self::TAIL_MASK)
+    }
+    const TAIL_MASK: BitMaskWord = Group::LOWEST_MASK[N % Group::SIZE];
+
+    #[inline]
+    pub(crate) fn group_size(&self) -> usize {
+        Group::SIZE
     }
 }
 
@@ -78,8 +104,8 @@ impl<const N: usize, T> RawInline<N, T> {
             unsafe {
                 drop(RawIntoIter {
                     inner: self.raw_iter_inner(),
-                    aligned_groups: (&self.aligned_groups as *const AlignedGroups<N>).read(),
-                    data: (&self.data as *const [MaybeUninit<T>; N]).read(),
+                    aligned_tags: (&self.aligned_tags as *const AlignedTags<N>).read(),
+                    entries: (&self.entries as *const [MaybeUninit<T>; N]).read(),
                 });
             }
         }
@@ -87,9 +113,9 @@ impl<const N: usize, T> RawInline<N, T> {
 
     /// Gets a reference to an element in the table.
     #[inline]
-    fn get(&self, hash: u64, eq: impl FnMut(&T) -> bool) -> Option<&T> {
+    fn get(&self, hash: u64, matches_entry: impl FnMut(&T) -> bool) -> Option<&T> {
         // Avoid `Option::map` because it bloats LLVM IR.
-        match self.find(hash, eq) {
+        match self.find(hash, matches_entry) {
             Some(bucket) => Some(unsafe { bucket.as_ref() }),
             None => None,
         }
@@ -97,44 +123,51 @@ impl<const N: usize, T> RawInline<N, T> {
 
     /// Gets a mutable reference to an element in the table.
     #[inline]
-    fn get_mut(&mut self, hash: u64, eq: impl FnMut(&T) -> bool) -> Option<&mut T> {
+    fn get_mut(&mut self, hash: u64, matches_entry: impl FnMut(&T) -> bool) -> Option<&mut T> {
         // Avoid `Option::map` because it bloats LLVM IR.
-        match self.find(hash, eq) {
+        match self.find(hash, matches_entry) {
             Some(bucket) => Some(unsafe { bucket.as_mut() }),
             None => None,
         }
     }
 
-    const UNCHECKED_GROUP: usize = N / Group::WIDTH;
-    const TAIL_MASK: BitMaskWord = Group::LOWEST_MASK[N % Group::WIDTH];
-
     /// Searches for an element in the table.
     #[inline]
-    fn find(&self, hash: u64, mut eq: impl FnMut(&T) -> bool) -> Option<Bucket<T>> {
+    fn find(
+        &self,
+        value_hash: u64,
+        mut matches_entry: impl FnMut(&T) -> bool,
+    ) -> Option<EntryRef<T>> {
         unsafe {
-            let h2_hash = h2(hash);
-            let mut probe_pos = 0;
+            let value_hash = h2(value_hash);
+            let mut group_index = 0;
 
             // Manually expand the loop
-            for _ in 0..Self::UNCHECKED_GROUP {
-                let group = Group::load(self.aligned_groups.ctrl(probe_pos));
-                let matches = group.match_byte(h2_hash);
-                for bit in matches {
-                    let index = probe_pos + bit;
-                    if likely(eq(self.data.get_unchecked(index).assume_init_ref())) {
-                        return Some(self.bucket(index));
+            for _ in 0..self.aligned_tags.num_complete_groups() {
+                let group = self.aligned_tags.group_unchecked(group_index);
+                let matched_tags = group.match_byte(value_hash);
+
+                for tag_index in matched_tags {
+                    let entry_index = self.entry_index(group_index, tag_index);
+                    if likely(matches_entry(
+                        self.entries.get_unchecked(entry_index).assume_init_ref(),
+                    )) {
+                        return Some(self.bucket(entry_index));
                     }
                 }
-                probe_pos += Group::WIDTH;
+                group_index += 1;
             }
-            if N % Group::WIDTH != 0 {
-                let group = Group::load(self.aligned_groups.ctrl(probe_pos));
+            if let Some(tail_mask) = self.aligned_tags.tail_mask() {
+                let group = self.aligned_tags.group_unchecked(group_index);
                 // Clear invalid tail.
-                let matches = group.match_byte(h2_hash).and(Self::TAIL_MASK);
-                for bit in matches {
-                    let index = probe_pos + bit;
-                    if likely(eq(self.data.get_unchecked(index).assume_init_ref())) {
-                        return Some(self.bucket(index));
+                let matched_tags = group.match_byte(value_hash).and(tail_mask);
+
+                for tag_index in matched_tags {
+                    let entry_index = self.entry_index(group_index, tag_index);
+                    if likely(matches_entry(
+                        self.entries.get_unchecked(entry_index).assume_init_ref(),
+                    )) {
+                        return Some(self.bucket(entry_index));
                     }
                 }
             }
@@ -146,70 +179,74 @@ impl<const N: usize, T> RawInline<N, T> {
     /// returns `Err` with the position of a slot where an element with the
     /// same hash could be inserted.
     #[inline]
-    fn find_or_find_insert_slot(
+    fn find_or_find_vacant_entry(
         &mut self,
         hash: u64,
-        mut eq: impl FnMut(&T) -> bool,
-    ) -> Result<Bucket<T>, InsertSlot> {
+        mut matches_entry: impl FnMut(&T) -> bool,
+    ) -> Result<EntryRef<T>, VacantEntry> {
         unsafe {
-            let mut insert_slot = None;
-            let h2_hash = h2(hash);
-            let mut probe_pos = 0;
+            let mut vacant_entry = None;
+            let tag = h2(hash);
+            let mut group_index = 0;
 
             // Manually expand the loop
-            for _ in 0..Self::UNCHECKED_GROUP {
-                let group = Group::load(self.aligned_groups.ctrl(probe_pos));
-                let matches = group.match_byte(h2_hash);
-                for bit in matches {
-                    let index = probe_pos + bit;
-                    if likely(eq(self.data.get_unchecked(index).assume_init_ref())) {
-                        return Ok(self.bucket(index));
+            for _ in 0..self.aligned_tags.num_complete_groups() {
+                let group = self.aligned_tags.group_unchecked(group_index);
+                let matched_tags = group.match_byte(tag);
+                for tag_index in matched_tags {
+                    let entry_index = self.entry_index(group_index, tag_index);
+                    if likely(matches_entry(
+                        self.entries.get_unchecked(entry_index).assume_init_ref(),
+                    )) {
+                        return Ok(self.bucket(entry_index));
                     }
                 }
 
                 // We didn't find the element we were looking for in the group, try to get an
                 // insertion slot from the group if we don't have one yet.
-                if likely(insert_slot.is_none()) {
-                    insert_slot = self.find_insert_slot_in_group(&group, probe_pos);
+                if likely(vacant_entry.is_none()) {
+                    vacant_entry = self.find_vacant_entry_in_group(&group, group_index);
                 }
 
                 // If there's empty set, we should stop searching next group.
                 if likely(group.match_empty().any_bit_set()) {
                     break;
                 }
-                probe_pos += Group::WIDTH;
+                group_index += 1;
             }
-            if N % Group::WIDTH != 0 {
-                let group = Group::load(self.aligned_groups.ctrl(probe_pos));
-                let matches = group.match_byte(h2_hash).and(Self::TAIL_MASK);
-                for bit in matches {
-                    let index = probe_pos + bit;
-                    if likely(eq(self.data.get_unchecked(index).assume_init_ref())) {
-                        return Ok(self.bucket(index));
+            if let Some(tail_mask) = self.aligned_tags.tail_mask() {
+                let group = self.aligned_tags.group_unchecked(group_index);
+                let matched_tags = group.match_byte(tag).and(tail_mask);
+                for tag_index in matched_tags {
+                    let entry_index = self.entry_index(group_index, tag_index);
+                    if likely(matches_entry(
+                        self.entries.get_unchecked(entry_index).assume_init_ref(),
+                    )) {
+                        return Ok(self.bucket(entry_index));
                     }
                 }
 
                 // We didn't find the element we were looking for in the group, try to get an
                 // insertion slot from the group if we don't have one yet.
-                if likely(insert_slot.is_none()) {
-                    insert_slot = self.find_insert_slot_in_group(&group, probe_pos);
+                if likely(vacant_entry.is_none()) {
+                    vacant_entry = self.find_vacant_entry_in_group(&group, group_index);
                 }
             }
 
-            Err(InsertSlot {
-                index: insert_slot.unwrap_unchecked(),
+            Err(VacantEntry {
+                index: vacant_entry.unwrap_unchecked(),
             })
         }
     }
 
     /// Finds the position to insert something in a group.
     #[inline]
-    fn find_insert_slot_in_group(&self, group: &Group, probe_seq: usize) -> Option<usize> {
-        let bit = group.match_empty_or_deleted().lowest_set_bit();
+    fn find_vacant_entry_in_group(&self, group: &Group, group_index: usize) -> Option<usize> {
+        let invalid_tag_index = group.match_empty_or_deleted().lowest_set_bit();
 
-        if likely(bit.is_some()) {
-            let n = unsafe { bit.unwrap_unchecked() };
-            return Some(probe_seq + n);
+        if likely(invalid_tag_index.is_some()) {
+            let invalid_tag_index = unsafe { invalid_tag_index.unwrap_unchecked() };
+            return Some(self.entry_index(group_index, invalid_tag_index));
         }
         None
     }
@@ -217,7 +254,12 @@ impl<const N: usize, T> RawInline<N, T> {
     /// Inserts a new element into the table in the given slot, and returns its
     /// raw bucket.
     #[inline]
-    unsafe fn insert_in_slot(&mut self, hash: u64, slot: InsertSlot, value: T) -> Bucket<T> {
+    unsafe fn insert_to_vacant_entry(
+        &mut self,
+        hash: u64,
+        slot: VacantEntry,
+        value: T,
+    ) -> EntryRef<T> {
         self.record_item_insert_at(slot.index, hash);
         let bucket = self.bucket(slot.index);
         bucket.write(value);
@@ -228,23 +270,23 @@ impl<const N: usize, T> RawInline<N, T> {
     /// raw bucket.
     #[inline]
     unsafe fn record_item_insert_at(&mut self, index: usize, hash: u64) {
-        self.set_ctrl_h2(index, hash);
+        self.set_tag_h2(index, hash);
         self.len += 1;
     }
 
     /// Sets a control byte to the hash, and possibly also the replicated control byte at
     /// the end of the array.
     #[inline]
-    unsafe fn set_ctrl_h2(&mut self, index: usize, hash: u64) {
+    unsafe fn set_tag_h2(&mut self, index: usize, hash: u64) {
         // SAFETY: The caller must uphold the safety rules for the [`RawTableInner::set_ctrl_h2`]
-        *self.aligned_groups.ctrl(index) = h2(hash);
+        *self.aligned_tags.tag(index) = h2(hash);
     }
 
     /// Finds and removes an element from the table, returning it.
     #[inline]
-    fn remove_entry(&mut self, hash: u64, eq: impl FnMut(&T) -> bool) -> Option<T> {
+    fn remove_entry(&mut self, hash: u64, matches_entry: impl FnMut(&T) -> bool) -> Option<T> {
         // Avoid `Option::map` because it bloats LLVM IR.
-        match self.find(hash, eq) {
+        match self.find(hash, matches_entry) {
             Some(bucket) => Some(unsafe { self.remove(bucket).0 }),
             None => None,
         }
@@ -253,11 +295,11 @@ impl<const N: usize, T> RawInline<N, T> {
     /// Removes an element from the table, returning it.
     #[inline]
     #[allow(clippy::needless_pass_by_value)]
-    unsafe fn remove(&mut self, item: Bucket<T>) -> (T, InsertSlot) {
+    unsafe fn remove(&mut self, item: EntryRef<T>) -> (T, VacantEntry) {
         self.erase_no_drop(&item);
         (
             item.read(),
-            InsertSlot {
+            VacantEntry {
                 index: self.bucket_index(&item),
             },
         )
@@ -265,38 +307,38 @@ impl<const N: usize, T> RawInline<N, T> {
 
     /// Erases an element from the table without dropping it.
     #[inline]
-    unsafe fn erase_no_drop(&mut self, item: &Bucket<T>) {
+    unsafe fn erase_no_drop(&mut self, item: &EntryRef<T>) {
         let index = self.bucket_index(item);
         self.erase(index);
     }
 
     /// Returns the index of a bucket from a `Bucket`.
     #[inline]
-    unsafe fn bucket_index(&self, bucket: &Bucket<T>) -> usize {
-        bucket.to_base_index(NonNull::new_unchecked(self.data.as_ptr() as _))
+    unsafe fn bucket_index(&self, bucket: &EntryRef<T>) -> usize {
+        bucket.to_base_index(NonNull::new_unchecked(self.entries.as_ptr() as _))
     }
 
     /// Erases the [`Bucket`]'s control byte at the given index so that it does not
     /// triggered as full, decreases the `items` of the table and, if it can be done,
     /// increases `self.growth_left`.
     #[inline]
-    unsafe fn erase(&mut self, index: usize) {
-        *self.aligned_groups.ctrl(index) = DELETED;
+    unsafe fn erase(&mut self, entry_index: usize) {
+        *self.aligned_tags.tag(entry_index) = DELETED;
         self.len -= 1;
     }
 
     /// Returns a pointer to an element in the table.
     #[inline]
-    unsafe fn bucket(&self, index: usize) -> Bucket<T> {
-        Bucket::from_base_index(
-            NonNull::new_unchecked(transmute(self.data.as_ptr().cast_mut())),
-            index,
+    unsafe fn bucket(&self, entry_index: usize) -> EntryRef<T> {
+        EntryRef::from_base_index(
+            NonNull::new_unchecked(transmute(self.entries.as_ptr().cast_mut())),
+            entry_index,
         )
     }
 
     #[inline]
     unsafe fn raw_iter_inner(&self) -> RawIterInner<T> {
-        let init_group = Group::load_aligned(self.aligned_groups.ctrl(0)).match_full();
+        let init_group = Group::load_aligned(self.aligned_tags.tag(0)).match_full();
         RawIterInner::new(init_group, self.len)
     }
 
@@ -304,9 +346,13 @@ impl<const N: usize, T> RawInline<N, T> {
     fn iter(&self) -> RawIter<'_, N, T> {
         RawIter {
             inner: unsafe { self.raw_iter_inner() },
-            aligned_groups: &self.aligned_groups,
-            data: &self.data,
+            aligned_groups: &self.aligned_tags,
+            data: &self.entries,
         }
+    }
+
+    fn entry_index(&self, group_index: usize, tag_index: usize) -> usize {
+        self.aligned_tags.group_size() * group_index + tag_index
     }
 }
 
@@ -319,8 +365,8 @@ impl<const N: usize, T> IntoIterator for RawInline<N, T> {
         let ret = unsafe {
             RawIntoIter {
                 inner: self.raw_iter_inner(),
-                aligned_groups: (&self.aligned_groups as *const AlignedGroups<N>).read(),
-                data: (&self.data as *const [MaybeUninit<T>; N]).read(),
+                aligned_tags: (&self.aligned_tags as *const AlignedTags<N>).read(),
+                entries: (&self.entries as *const [MaybeUninit<T>; N]).read(),
             }
         };
         mem::forget(self);
@@ -403,13 +449,13 @@ impl<const N: usize, K, V, S> Inline<N, K, V, S> {
         assert!(N != 0, "SmallMap cannot be initialized with zero size.");
         Self {
             raw: RawInline {
-                aligned_groups: AlignedGroups {
-                    groups: [EMPTY; N],
+                aligned_tags: AlignedTags {
+                    tags: [EMPTY; N],
                     _align: [],
                 },
                 len: 0,
                 // TODO: use uninit_array when stable
-                data: unsafe { MaybeUninit::<[MaybeUninit<(K, V)>; N]>::uninit().assume_init() },
+                entries: unsafe { MaybeUninit::<[MaybeUninit<(K, V)>; N]>::uninit().assume_init() },
             },
             hash_builder: Some(hash_builder),
         }
@@ -450,9 +496,9 @@ where
 {
     /// Returns a reference to the value corresponding to the key.
     #[inline]
-    pub(crate) fn get<Q: ?Sized>(&self, k: &Q) -> Option<&V>
+    pub(crate) fn get<Q>(&self, k: &Q) -> Option<&V>
     where
-        Q: Hash + Equivalent<K>,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         // Avoid `Option::map` because it bloats LLVM IR.
         match self.get_inner(k) {
@@ -463,9 +509,9 @@ where
 
     /// Returns a reference to the value corresponding to the key.
     #[inline]
-    pub(crate) fn get_mut<Q: ?Sized>(&mut self, k: &Q) -> Option<&mut V>
+    pub(crate) fn get_mut<Q>(&mut self, k: &Q) -> Option<&mut V>
     where
-        Q: Hash + Equivalent<K>,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         // Avoid `Option::map` because it bloats LLVM IR.
         match self.get_inner_mut(k) {
@@ -476,9 +522,9 @@ where
 
     /// Returns the key-value pair corresponding to the supplied key.
     #[inline]
-    pub(crate) fn get_key_value<Q: ?Sized>(&self, k: &Q) -> Option<(&K, &V)>
+    pub(crate) fn get_key_value<Q>(&self, k: &Q) -> Option<(&K, &V)>
     where
-        Q: Hash + Equivalent<K>,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         // Avoid `Option::map` because it bloats LLVM IR.
         match self.get_inner(k) {
@@ -491,11 +537,11 @@ where
     #[inline]
     pub(crate) fn insert(&mut self, k: K, v: V) -> Option<V> {
         let hash = make_hash::<K, S>(self.hash_builder(), &k);
-        match self.raw.find_or_find_insert_slot(hash, equivalent_key(&k)) {
+        match self.raw.find_or_find_vacant_entry(hash, equivalent_key(&k)) {
             Ok(bucket) => Some(mem::replace(unsafe { &mut bucket.as_mut().1 }, v)),
             Err(slot) => {
                 unsafe {
-                    self.raw.insert_in_slot(hash, slot, (k, v));
+                    self.raw.insert_to_vacant_entry(hash, slot, (k, v));
                 }
                 None
             }
@@ -505,18 +551,18 @@ where
     /// Removes a key from the map, returning the stored key and value if the
     /// key was previously in the map. Keeps the allocated memory for reuse.
     #[inline]
-    pub(crate) fn remove_entry<Q: ?Sized>(&mut self, k: &Q) -> Option<(K, V)>
+    pub(crate) fn remove_entry<Q>(&mut self, k: &Q) -> Option<(K, V)>
     where
-        Q: Hash + Equivalent<K>,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         let hash = make_hash::<Q, S>(self.hash_builder(), k);
         self.raw.remove_entry(hash, equivalent_key(k))
     }
 
     #[inline]
-    fn get_inner<Q: ?Sized>(&self, k: &Q) -> Option<&(K, V)>
+    fn get_inner<Q>(&self, k: &Q) -> Option<&(K, V)>
     where
-        Q: Hash + Equivalent<K>,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         if self.is_empty() {
             None
@@ -527,9 +573,9 @@ where
     }
 
     #[inline]
-    fn get_inner_mut<Q: ?Sized>(&mut self, k: &Q) -> Option<&mut (K, V)>
+    fn get_inner_mut<Q>(&mut self, k: &Q) -> Option<&mut (K, V)>
     where
-        Q: Hash + Equivalent<K>,
+        Q: Hash + Equivalent<K> + ?Sized,
     {
         if self.is_empty() {
             None

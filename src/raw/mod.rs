@@ -40,7 +40,7 @@ pub(crate) use imp::{BitMaskWord, Group};
 
 use self::{
     bitmask::{BitMask, BitMaskIter},
-    util::Bucket,
+    util::EntryRef,
 };
 
 // Constant for h2 function that grabing the top 7 bits of the hash.
@@ -89,13 +89,13 @@ impl<T> RawIterInner<T> {
     }
 
     #[inline]
-    unsafe fn next_impl(&mut self, group_base: NonNull<u8>, base: Bucket<T>) -> Bucket<T> {
+    unsafe fn next_impl(&mut self, group_base: NonNull<u8>, base: EntryRef<T>) -> EntryRef<T> {
         loop {
             if let Some(index) = self.current_group.next() {
                 return base.next_n(index + self.group_offset);
             }
 
-            self.group_offset += Group::WIDTH;
+            self.group_offset += Group::SIZE;
             self.current_group = Group::load_aligned(group_base.as_ptr().add(self.group_offset))
                 .match_full()
                 .into_iter();
@@ -103,7 +103,11 @@ impl<T> RawIterInner<T> {
     }
 
     #[inline]
-    pub(crate) fn next(&mut self, group_base: NonNull<u8>, base: Bucket<T>) -> Option<Bucket<T>> {
+    pub(crate) fn next(
+        &mut self,
+        group_base: NonNull<u8>,
+        base: EntryRef<T>,
+    ) -> Option<EntryRef<T>> {
         if unlikely(self.len == 0) {
             return None;
         }
@@ -123,7 +127,7 @@ impl<T> RawIterInner<T> {
 }
 
 impl<T> RawIterInner<T> {
-    pub(crate) unsafe fn drop_elements(&mut self, group_base: NonNull<u8>, base: Bucket<T>) {
+    pub(crate) unsafe fn drop_elements(&mut self, group_base: NonNull<u8>, base: EntryRef<T>) {
         if T::NEEDS_DROP && self.len != 0 {
             while let Some(item) = self.next(group_base, base.clone()) {
                 item.drop();

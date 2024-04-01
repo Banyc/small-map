@@ -19,8 +19,8 @@ pub(crate) struct Group(neon::uint8x8_t);
 #[allow(clippy::use_self)]
 impl Group {
     /// Number of bytes in the group.
-    pub(crate) const WIDTH: usize = mem::size_of::<Self>();
-    pub(crate) const LOWEST_MASK: [BitMaskWord; Group::WIDTH] = [
+    pub(crate) const SIZE: usize = mem::size_of::<Self>();
+    pub(crate) const LOWEST_MASK: [BitMaskWord; Group::SIZE] = [
         0x0000_0000_0000_0000,
         0x0000_0000_0000_0080,
         0x0000_0000_0000_8080,
